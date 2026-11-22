@@ -1,0 +1,9 @@
+{
+  "name": "pi-work-engine-context-pressure",
+  "version": "0.1.0",
+  "private": true,
+  "keywords": ["pi-package"],
+  "scripts": { "test": "node --test" },
+  "peerDependencies": { "@earendil-works/pi-coding-agent": ">=1.5.2" },
+  "pi": { "extensions": ["./index.ts"] }
+}

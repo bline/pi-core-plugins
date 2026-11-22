@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "repository": "/absolute/path/to/the/coordination-checkout",
+  "boardScript": "/absolute/path/to/trusted/work-engine/skills/durable-state/scripts/codex_chatboard.py",
+  "python": "/usr/bin/python3",
+  "path": ["/usr/bin"],
+  "stateDir": "/absolute/private/path/pi-chatboard",
+  "group": "pilot1",
+  "coordinator": "lead",
+  "members": ["lead", "one", "two", "three", "four", "five"],
+  "start": "now",
+  "suppressSelf": false,
+  "maxRows": 128,
+  "maxBytes": 1048576
+}

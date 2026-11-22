@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "reader": "/absolute/path/to/digest-pinned/work-engine-context-status",
+  "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "triggerTokens": 125000,
+  "bandFloorTokens": 150000,
+  "leadCalls": 3
+}

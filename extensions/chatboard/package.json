@@ -1,0 +1,13 @@
+{
+  "name": "pi-chatboard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "keywords": ["pi-package"],
+  "engines": { "node": ">=22.13" },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "pi": { "extensions": ["./index.ts"] }
+}

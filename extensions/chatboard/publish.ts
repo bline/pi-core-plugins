@@ -4,7 +4,7 @@ import { boardTail, readRows, row, type BoardCall, type Delivery, type Row } fro
 import type { Membership, Store, StoredIntent, WakeState } from "./store.ts";
 
 export type Send = {
-  action: "report" | "note" | "forward";
+  action: "note" | "forward";
   targets?: string[];
   body?: string;
   original?: Delivery;
@@ -23,8 +23,7 @@ export type HandoffResult = SendResult & {
 type Resolve = { byMember(alias: string): Membership | undefined; bySession(id: string): Membership | undefined };
 
 export function intentFields(p: Profile, owner: Membership, lookup: Resolve, send: Send, exactWake = false): Omit<Intent, "since"> {
-  const targets = send.action === "report" ? [p.coordinator] : send.targets;
-  if (send.action === "report" && owner.member === p.coordinator) throw new Error("report is for lanes; use tell or note");
+  const { targets } = send;
   if (!Array.isArray(targets) || targets.length < 1 || targets.length > 16) throw new Error("specify 1–16 recipients");
   const members = new Set<string>();
   const to = targets.map(target => {
@@ -36,7 +35,7 @@ export function intentFields(p: Profile, owner: Membership, lookup: Resolve, sen
     }
     if (members.has(recipient.member)) throw new Error("duplicate recipient");
     members.add(recipient.member);
-    if (exactWake && recipient.session === owner.session) throw new Error("tell is for other enrolled lanes; use note for self");
+    if (exactWake && recipient.session === owner.session) throw new Error("cannot wake yourself; use note for self");
     return exactWake ? `session:${recipient.session}` : id ? `session:${id}` : `role:${roleName(p.group, recipient.member)}`;
   });
   const original = send.original?.row;
@@ -112,6 +111,15 @@ export class Publisher {
     });
   }
 
+  report(body?: string): Promise<HandoffResult> {
+    return this.exclusive(async () => {
+      this.owned();
+      if (this.owner.member === this.p.coordinator) throw new Error("report is for lanes; use tell or note");
+      return this.startHandoff([intentFields(this.p, this.owner, this.store,
+        { action: "note", targets: [this.p.coordinator], body }, true)]);
+    });
+  }
+
   tell(messages: Tell[]): Promise<HandoffResult> {
     return this.exclusive(async () => {
       this.owned();
@@ -122,13 +130,17 @@ export class Publisher {
             || Object.keys(entry).some(k => k !== "targets" && k !== "body")) throw new Error("each tell message needs targets and body");
         return intentFields(this.p, this.owner, this.store, { ...entry, action: "note" }, true);
       });
-      const since = await boardTail(this.call);
-      this.owned();
-      const id = randomUUID();
-      const items = fields.map(f => ({ id: randomUUID(), payload: JSON.stringify({ ...f, since }) }));
-      this.store.beginHandoff(this.owner, id, items);
-      return this.publishHandoff(id, false);
+      return this.startHandoff(fields);
     });
+  }
+
+  private async startHandoff(fields: Omit<Intent, "since">[]): Promise<HandoffResult> {
+    const since = await boardTail(this.call);
+    this.owned();
+    const id = randomUUID();
+    const items = fields.map(f => ({ id: randomUUID(), payload: JSON.stringify({ ...f, since }) }));
+    this.store.beginHandoff(this.owner, id, items);
+    return this.publishHandoff(id, false);
   }
 
   retry(id: string): Promise<SendResult | HandoffResult> {

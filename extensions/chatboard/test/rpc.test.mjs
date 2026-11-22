@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -83,9 +83,21 @@ class Rpc {
     await this.request("prompt", { message: text });
     await until(() => this.events.slice(cut).some(e => e.type === "agent_end"), "fixture turn ends");
   }
-  async command(command) {
+  async command(command, dialogs = []) {
     const cut = this.events.length;
-    await this.request("prompt", { message: `/chatboard ${command}` });
+    const answer = async () => {
+      let after = cut;
+      for (const [method, reply] of dialogs) {
+        const index = await until(() => {
+          const i = this.events.findIndex((e, i) => i >= after && e.type === "extension_ui_request" && e.method === method);
+          return i >= 0 ? i + 1 : undefined;
+        }, `chatboard ${command} ${method}`) - 1;
+        const item = this.events[index];
+        this.child.stdin.write(JSON.stringify({ type: "extension_ui_response", id: item.id, ...reply(item) }) + "\n");
+        after = index + 1;
+      }
+    };
+    await Promise.all([this.request("prompt", { message: `/chatboard ${command}` }), answer()]);
     const item = await until(() => this.events.slice(cut).find(e => e.type === "extension_ui_request"
       && e.method === "notify" && typeof e.message === "string" && e.message.startsWith("{")), `chatboard ${command}`);
     return JSON.parse(item.message);
@@ -127,7 +139,7 @@ function lab(t, options = {}) {
     await Promise.all(owned.map(rpc => rpc.close()));
     rmSync(root, { recursive: true, force: true });
   });
-  return { root, repo, agent, sessions, profile, env, setProfile, board,
+  return { root, repo, agent, sessions, profile, stateDir, env, setProfile, board,
     hasDurableDelivery(id, sequence) {
       const bucket = createHash("sha256").update(join(repo, ".git")).digest("hex");
       const db = new DatabaseSync(join(stateDir, bucket, "inbox.sqlite3"), { readOnly: true });
@@ -142,7 +154,8 @@ function lab(t, options = {}) {
         "--no-mcp", "--no-approve", "--mode", "rpc", "-e", extension, "--session-dir", sessions,
         ...(file ? ["--session", file] : ["--session-id", id]), ...extras];
       const rpc = new Rpc(spawn(pi, args, { cwd: repo, env: { ...env, ...envExtras,
-        CHATBOARD_MODEL_MODULE: fauxModule, PI_CHATBOARD_PROFILE: profilePath,
+        CHATBOARD_MODEL_MODULE: fauxModule,
+        ...(profilePath === null ? {} : { PI_CHATBOARD_PROFILE: profilePath }),
         ...(member === undefined ? {} : { PI_CHATBOARD_MEMBER: member }),
       } }));
       owned.push(rpc);
@@ -153,6 +166,189 @@ function lab(t, options = {}) {
 
 const listening = s => s.state === "listening" && s.waiterPid;
 const count = n => s => s.rows === n && s.state === "listening";
+
+test("default profile discovery stays off without a file and keeps first enrollment explicit", { timeout: 30000 }, async t => {
+  const f = lab(t);
+  const defaultPath = join(f.agent, "chatboard.json");
+  const { rpc } = f.rpc("one", {
+    profilePath: null, extras: fauxArgs, envExtras: { CHATBOARD_MODEL_LAB: f.root },
+  });
+  const inactive = await rpc.status();
+  assert.equal(inactive.state, "off");
+  assert.equal(inactive.profilePath, defaultPath);
+  assert.match(inactive.reason, /not found/);
+  assert.equal(inactive.waiterPid, undefined);
+
+  f.setProfile({}, defaultPath);
+  await rpc.request("prompt", { message: "/test-reload" });
+  const reloaded = await rpc.status();
+  assert.equal(reloaded.profilePath, defaultPath);
+  assert.equal(reloaded.group, "alpha");
+  assert.equal(reloaded.state, "off", "reload must not enroll an unbound session");
+  assert.equal(reloaded.waiterPid, undefined);
+  rpc.assertQuiet();
+
+  const implicit = f.rpc(undefined, { profilePath: null });
+  assert.equal((await implicit.rpc.status()).state, "off", "no implicit member selection");
+  const enrolled = f.rpc("one", { profilePath: null });
+  const active = await enrolled.rpc.status(listening);
+  assert.equal(active.profilePath, defaultPath);
+  assert.equal(active.session, enrolled.id);
+  const row = f.post("role:alpha-one", "default-profile fixture");
+  assert.equal((await enrolled.rpc.status(count(1))).cursor, row.sequence);
+  enrolled.rpc.assertQuiet();
+});
+
+test("explicit profile takes precedence and a missing override cannot enroll on the default", { timeout: 30000 }, async t => {
+  const f = lab(t);
+  f.setProfile({}, join(f.agent, "chatboard.json"));
+  const override = join(f.root, "override.json");
+  const missing = f.rpc("one", { profilePath: override });
+  const failed = await missing.rpc.status();
+  assert.equal(failed.profilePath, override);
+  assert.equal(failed.state, "unavailable");
+  assert.equal(failed.waiterPid, undefined);
+  missing.rpc.assertQuiet();
+  f.setProfile({ group: "beta" }, override);
+  const explicit = f.rpc("one", { profilePath: override });
+  const active = await explicit.rpc.status(listening);
+  assert.equal(active.profilePath, override);
+  assert.equal(active.group, "beta");
+  explicit.rpc.assertQuiet();
+});
+
+test("setup previews and saves a fresh default profile without enrolling; join applies it in the same Pi", { timeout: 30000 }, async t => {
+  const f = lab(t);
+  const { rpc, id } = f.rpc(undefined, { profilePath: null });
+  const profilePath = join(f.agent, "chatboard.json");
+  const draft = readFileSync(f.profile, "utf8");
+  const initial = await rpc.command("config");
+  assert.equal(initial.profilePath, profilePath);
+  assert.equal(initial.profileOverride, null);
+  assert.deepEqual(initial.saved, { state: "missing" });
+  assert.equal(initial.active.state, "off");
+  assert.match((await rpc.command("join one")).error, /no selected profile/);
+  assert.equal((await rpc.command("setup", [["editor", item => {
+    assert.match(item.title, /chatboard\.json/);
+    assert.equal(JSON.parse(item.prefill).repository, "");
+    return { cancelled: true };
+  }]])).state, "cancelled");
+  assert.match((await rpc.command("setup", [["editor", () => ({ value: '{"version":2}' })]])).error, /version/);
+  const edit = ["editor", () => ({ value: draft })];
+  const confirmations = () => rpc.events.filter(e => e.type === "extension_ui_request" && e.method === "confirm");
+  assert.equal(confirmations().length, 0);
+  assert.equal((await rpc.command("setup", [edit, ["confirm", item => {
+    assert.ok(item.message.includes(profilePath));
+    assert.ok(item.message.includes(join(f.repo, ".git")));
+    assert.match(item.message, /group alpha · coordinator lead/);
+    assert.match(item.message, /role:alpha-lead, role:alpha-one, .*role:alpha-five/);
+    assert.match(item.message, /session:<its Pi UUID>/);
+    return { confirmed: false };
+  }]])).state, "cancelled");
+  assert.equal(existsSync(profilePath), false);
+  assert.equal(existsSync(f.stateDir), false, "preview did not create runtime directories");
+
+  assert.deepEqual(await rpc.command("setup", [edit, ["confirm", () => ({ confirmed: true })]]), {
+    state: "saved", profilePath, liveRoutingChanged: false,
+  });
+  assert.equal(readFileSync(profilePath, "utf8"), draft + "\n");
+  assert.equal(statSync(profilePath).mode & 0o777, 0o600);
+  const saved = await rpc.command("config");
+  assert.deepEqual(saved.saved, { state: "present", matchesLoaded: null });
+  assert.equal(saved.active.state, "off");
+  assert.equal(existsSync(f.stateDir), false, "save did not create runtime directories");
+  const old = f.post("role:alpha-one", "before explicit join");
+  assert.deepEqual(await rpc.command("join one"), { state: "enrolled", profilePath, group: "alpha", member: "one", session: id, cursor: old.sequence });
+  await rpc.status(listening);
+  const active = await rpc.command("config");
+  assert.deepEqual(active.saved, { state: "present", matchesLoaded: true });
+  assert.deepEqual(active.active.selectors, ["role:alpha-one", `session:${id}`]);
+  assert.deepEqual(await rpc.command("inbox"), { sequences: [] });
+  const row = f.post("role:alpha-one", "after explicit join");
+  assert.equal((await rpc.status(count(1))).cursor, row.sequence);
+  assert.match((await rpc.command("join two")).error, /already assigned/);
+  assert.equal(existsSync((await rpc.request("get_state")).sessionFile), false);
+  rpc.assertQuiet();
+});
+
+test("setting up a selected override leaves a live lane, inbox, and cursor unchanged", { timeout: 30000 }, async t => {
+  const f = lab(t);
+  const defaultPath = join(f.agent, "chatboard.json");
+  f.setProfile({ group: "default" }, defaultPath);
+  const defaultBytes = readFileSync(defaultPath, "utf8");
+  const lane = f.rpc("one");
+  const before = await lane.rpc.status(listening);
+  const row = f.post("role:alpha-one", "first inbox row");
+  await lane.rpc.status(count(1));
+  const draft = ["editor", item => {
+    const value = JSON.parse(item.prefill);
+    assert.equal(value.group, "alpha");
+    return { value: JSON.stringify({ ...value, group: "beta" }) };
+  }];
+  const save = await lane.rpc.command("setup", [draft, ["confirm", item => {
+    assert.match(item.message, /role:beta-one/);
+    return { confirmed: true };
+  }]]);
+  assert.equal(save.state, "saved");
+  assert.equal(JSON.parse(readFileSync(f.profile, "utf8")).group, "beta");
+  assert.equal(readFileSync(defaultPath, "utf8"), defaultBytes);
+  const config = await lane.rpc.command("config");
+  assert.equal(config.profilePath, f.profile);
+  assert.equal(config.profileOverride, f.profile);
+  assert.deepEqual(config.saved, { state: "present", matchesLoaded: false });
+  assert.equal(config.active.group, "alpha");
+  assert.deepEqual(config.active.selectors, ["role:alpha-one", `session:${lane.id}`]);
+  const after = await lane.rpc.status();
+  for (const k of ["state", "session", "group", "member", "keeperPid", "waiterPid"]) assert.equal(after[k], before[k], k);
+  assert.equal(after.cursor, row.sequence);
+  assert.deepEqual(await lane.rpc.command("inbox"), { sequences: [row.sequence] });
+  assert.match((await lane.rpc.command("join two")).error, /already assigned/);
+  f.post("role:beta-one", "not yet active");
+  const oldRoute = f.post("role:alpha-one", "still active");
+  assert.equal((await lane.rpc.status(count(2))).cursor, oldRoute.sequence);
+  assert.deepEqual(await lane.rpc.command("inbox"), { sequences: [row.sequence, oldRoute.sequence] });
+  lane.rpc.assertQuiet();
+});
+
+test("setup refuses to overwrite a profile changed during confirmation; unbound join refuses stale config", { timeout: 30000 }, async t => {
+  const f = lab(t);
+  const { rpc } = f.rpc(undefined, { extras: fauxArgs, envExtras: { CHATBOARD_MODEL_LAB: f.root } });
+  assert.equal((await rpc.status()).group, "alpha");
+  const result = await rpc.command("setup", [["editor", item => ({ value: JSON.stringify({ ...JSON.parse(item.prefill), group: "beta" }) })],
+    ["confirm", () => {
+      f.setProfile({ group: "gamma" });
+      return { confirmed: true };
+    }]]);
+  assert.match(result.error, /changed while editing/);
+  assert.equal(JSON.parse(readFileSync(f.profile, "utf8")).group, "gamma");
+  assert.match((await rpc.command("join one")).error, /differs from the loaded profile/);
+  assert.equal((await rpc.status()).state, "off");
+  await rpc.request("prompt", { message: "/test-reload" });
+  assert.equal((await rpc.status()).group, "gamma");
+  assert.equal((await rpc.command("join one")).group, "gamma");
+  await rpc.status(listening);
+  rpc.assertQuiet();
+});
+
+test("explicit joins contend for one durable lane and losing sessions can choose another", { timeout: 30000 }, async t => {
+  const f = lab(t);
+  const entrants = [f.rpc(undefined), f.rpc(undefined)];
+  await Promise.all(entrants.map(x => x.rpc.status(s => s.state === "off")));
+  assert.match((await entrants[0].rpc.command("join nowhere")).error, /not in this group/);
+  const results = await Promise.all(entrants.map(x => x.rpc.command("join one")));
+  const winner = results.findIndex(x => x.state === "enrolled");
+  assert.notEqual(winner, -1);
+  const loser = 1 - winner;
+  assert.match(results[loser].error, /already (live|enrolled)/);
+  const bound = await entrants[winner].rpc.status(listening);
+  assert.equal(bound.member, "one");
+  await entrants[winner].rpc.close();
+  assert.match((await entrants[loser].rpc.command("join one")).error, /already enrolled/);
+  assert.equal((await entrants[loser].rpc.status()).state, "off");
+  assert.equal((await entrants[loser].rpc.command("join two")).state, "enrolled");
+  assert.equal((await entrants[loser].rpc.status(listening)).member, "two");
+  entrants.forEach(x => x.rpc.assertQuiet());
+});
 
 test("private manifest is opt-in and a fresh Pi listens without a prompt or transcript", { timeout: 30000 }, async t => {
   const root = JSON.parse(readFileSync(new URL("../../../package.json", import.meta.url), "utf8"));
@@ -183,7 +379,7 @@ test("private manifest is opt-in and a fresh Pi listens without a prompt or tran
   await until(() => gone(active.waiterPid) && gone(active.keeperPid), "graceful watcher closure");
 });
 
-test("six fresh Pi sessions route quiet report, note, direct ID and selected forward only", { timeout: 45000 }, async t => {
+test("six fresh Pi sessions route quiet note, direct ID and selected forward only", { timeout: 45000 }, async t => {
   const fixture = lab(t, { suppressSelf: true });
   const names = ["lead", "one", "two", "three", "four", "five"];
   const [lead, one, two, three, four, five] = names.map(m => fixture.rpc(m));
@@ -193,7 +389,7 @@ test("six fresh Pi sessions route quiet report, note, direct ID and selected for
   fixture.setProfile({ group: "beta" }, foreignPath);
   const foreign = fixture.rpc("one", { profilePath: foreignPath });
   await foreign.rpc.status(listening);
-  const report = await one.rpc.command("report Ready for integration");
+  const report = await one.rpc.command("note lead Ready for integration");
   assert.equal(report.state, "confirmed", JSON.stringify(report));
   await lead.rpc.status(count(1));
   const original = JSON.parse((await lead.rpc.command(`show ${report.sequence}`)).jsonFragment).row;
@@ -252,6 +448,34 @@ async function checkWake({ rpc, id }, receipt, sequences, turnCount = 1) {
   return wake;
 }
 
+test("a report command wakes the coordinator once with the exact inbox pointer", { timeout: 30000 }, async t => {
+  const fixture = lab(t);
+  const lead = fixture.rpc("lead", handoffModel(fixture));
+  const lane = fixture.rpc("one"), other = fixture.rpc("two");
+  await Promise.all([lead, lane, other].map(({ rpc }) => rpc.status(listening)));
+  const quiet = await lane.rpc.command("note lead quiet update");
+  await lead.rpc.status(s => s.cursor >= quiet.sequence);
+  lead.rpc.assertQuiet();
+  assert.match((await lead.rpc.command("report cannot report to self")).error, /for lanes/);
+  const receipt = await lane.rpc.command("report finished");
+  assert.equal(receipt.state, "confirmed");
+  assert.equal(receipt.wakeSchedule, "registered");
+  assert.deepEqual(receipt.wakes.map(w => w.member), ["lead"]);
+  const row = boardRows(fixture).find(r => r.sequence === receipt.sequence);
+  assert.deepEqual(row.to, [`session:${lead.id}`]);
+  assert.notEqual(row.wake, true);
+  const wake = await checkWake(lead, receipt.id, [receipt.sequence]);
+  assert.match(wake.content, /^Chatboard report ready:/);
+  assert.ok(!wake.content.includes("finished"), "wake carries only a pointer");
+  assert.equal(JSON.parse((await lead.rpc.command(`show ${receipt.sequence}`)).jsonFragment).row.body, "finished");
+  const retried = await lane.rpc.command(`retry ${receipt.id}`);
+  assert.deepEqual(retried.wakes, [{ member: "lead", state: "submitted" }]);
+  assert.equal(boardRows(fixture).length, 2);
+  assert.equal(starts(lead.rpc), 1);
+  assert.deepEqual((await other.rpc.command("inbox")).sequences, []);
+  lane.rpc.assertQuiet(); other.rpc.assertQuiet();
+});
+
 for (const busy of [false, true]) {
   test(`one coordinator tell wakes each ${busy ? "settling" : "idle"} Pi once, then the model reads and reports`,
     { timeout: 35000 }, async t => {
@@ -308,6 +532,14 @@ for (const busy of [false, true]) {
       const reports = boardRows(fixture).filter(r => r.body.startsWith("read: "));
       assert.deepEqual(new Map(reports.map(r => [r.session_id, JSON.parse(r.body.slice(6))])),
         new Map([[one.id, batch.map(m => m.body)], [two.id, [batch[0].body]]]));
+      assert.ok(reports.every(r => r.to.length === 1 && r.to[0] === `session:${lead.id}`));
+      await until(() => ends(lead.rpc) === 3, "coordinator completes both report wakes after dispatch");
+      assert.equal(starts(lead.rpc), 3);
+      const leadWakes = transcriptWakes((await lead.rpc.request("get_state")).sessionFile);
+      assert.equal(leadWakes.length, 2);
+      assert.deepEqual(leadWakes.map(wake => Number(wake.content.match(/#(\d+)/)[1])).sort((a, b) => a - b),
+        reports.map(r => r.sequence).sort((a, b) => a - b));
+      assert.ok(leadWakes.every(wake => wake.content.startsWith("Chatboard report ready:")));
       const before = boardRows(fixture);
       const retry = await lead.rpc.command(`retry ${receipt.id}`);
       assert.deepEqual(retry.wakes, [{ member: "one", state: "submitted" }, { member: "two", state: "submitted" }]);

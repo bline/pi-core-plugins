@@ -18,7 +18,7 @@ export type Identity = { id: string; path: string };
 export type Profile = {
   group: string; coordinator: string; members: string[]; suppressSelf: boolean;
   start: "now" | number; maxRows: number; maxBytes: number;
-  common: string; device: string; inode: string; local: string;
+  repository: string; common: string; device: string; inode: string; stateDir: string; local: string;
   python: string; script: string; env: NodeJS.ProcessEnv;
 };
 
@@ -47,7 +47,7 @@ export function readBounded(path: string, max: number, firstLine = false): strin
     return bytes.subarray(0, length).toString("utf8");
   } finally { closeSync(fd); }
 }
-function absolute(x: unknown, name: string): string {
+export function absolute(x: unknown, name: string): string {
   if (typeof x !== "string" || !isAbsolute(x) || /[\x00-\x1f\x7f]/.test(x)) {
     throw new Error(`${name} must be an absolute path`);
   }
@@ -64,18 +64,39 @@ function directory(x: string): string {
   if (!statSync(path).isDirectory()) throw new Error("not a directory");
   return path;
 }
-function privateDirectory(path: string): string {
-  mkdirSync(path, { recursive: true, mode: 0o700 });
-  const stat = lstatSync(path);
-  if (!stat.isDirectory() || stat.uid !== process.getuid?.() || stat.mode & 0o077) {
-    throw new Error("chatboard state directory must be private (0700) and owned by this user");
+function prospectiveDirectory(path: string): string {
+  try { return directory(path); }
+  catch (e) {
+    if (!missing(e)) throw e;
+    // Do not project a missing path through a dangling symlink.
+    try { lstatSync(path); throw new Error("state directory path contains a dangling symlink"); }
+    catch (err) { if (!missing(err)) throw err; }
+    return join(prospectiveDirectory(dirname(path)), basename(path));
   }
-  return realpathSync(path);
+}
+function privateDirectory(path: string, create = false): string {
+  if (create) mkdirSync(path, { recursive: true, mode: 0o700 });
+  try {
+    const stat = lstatSync(path);
+    if (!stat.isDirectory() || stat.uid !== process.getuid?.() || stat.mode & 0o077) {
+      throw new Error("chatboard state directory must be private (0700) and owned by this user");
+    }
+    return realpathSync(path);
+  } catch (e) {
+    if (create || !missing(e)) throw e;
+    return prospectiveDirectory(path);
+  }
 }
 
-export function loadProfile(path: string): Profile {
+export function readProfileText(path: string, follow = true): string {
+  const absolutePath = absolute(path, "PI_CHATBOARD_PROFILE");
+  return readBounded(follow ? realpathSync(absolutePath) : absolutePath, 65536);
+}
+
+export function resolveProfile(text: string): Profile {
   if (process.platform !== "linux") throw new Error("chatboard pilot requires Linux");
-  const p = object(JSON.parse(readBounded(realpathSync(absolute(path, "PI_CHATBOARD_PROFILE")), 65536)));
+  if (Buffer.byteLength(text) > 65536) throw new Error("chatboard profile exceeds 64 KiB");
+  const p = object(JSON.parse(text));
   const fields = new Set(["version", "repository", "boardScript", "python", "path", "stateDir",
     "group", "coordinator", "members", "suppressSelf", "start", "maxRows", "maxBytes"]);
   if (p.version !== 1 || Object.keys(p).some(k => !fields.has(k))) throw new Error("unsupported profile field or version");
@@ -110,11 +131,18 @@ export function loadProfile(path: string): Profile {
   const common = directory(absolute(revParse(["--path-format=absolute", "--git-common-dir"]), "Git common directory"));
   if (revParse(["--show-ref-format"]) !== "files") throw new Error("board requires Git files ref backend");
   const { dev, ino } = statSync(common, { bigint: true });
-  const root = privateDirectory(absolute(p.stateDir, "stateDir"));
+  const stateDir = privateDirectory(absolute(p.stateDir, "stateDir"));
   // The same local user must use one state root for all profiles on this board.
-  const local = privateDirectory(join(root, digest(common)));
-  return { group, coordinator, members, start, maxRows, maxBytes, common, local, script, python,
-    device: String(dev), inode: String(ino), env, suppressSelf: p.suppressSelf === true };
+  const local = privateDirectory(join(stateDir, digest(common)));
+  return { group, coordinator, members, start, maxRows, maxBytes, repository, common, stateDir, local,
+    script, python, device: String(dev), inode: String(ino), env, suppressSelf: p.suppressSelf === true };
+}
+
+export function loadProfile(path: string, text = readProfileText(path)): Profile {
+  const profile = resolveProfile(text);
+  privateDirectory(profile.stateDir, true);
+  privateDirectory(profile.local, true);
+  return profile;
 }
 
 export function verifyBoard(p: Profile): void {

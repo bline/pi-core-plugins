@@ -16,10 +16,12 @@ export default async function fixture(pi: ExtensionAPI) {
   const faux = fauxProvider({ tokensPerSecond: 1_000_000, models: [{ id: "chatboard-fixture" }] });
   let calls = 0;
   let sequences: number[] = [];
+  let reportWake = false;
   let handoffStep = 0;
   if (handoff) pi.on("before_agent_start", event => {
     const msg = event.messageType === "custom" ? event.message : undefined;
     if (msg?.customType !== "pi-chatboard/handoff-v1" || typeof msg.content !== "string") return;
+    reportWake = msg.content.startsWith("Chatboard report ready:");
     sequences = [...msg.content.matchAll(/#(\d+)/g)].map(m => Number(m[1]));
     handoffStep = 0;
   });
@@ -38,6 +40,7 @@ export default async function fixture(pi: ExtensionAPI) {
           return JSON.parse(p.jsonFragment).row.body;
         });
         sequences = [];
+        if (reportWake) return fauxAssistantMessage(`read report: ${JSON.stringify(read)}`);
         return tools(fauxToolCall("chatboard", { action: "report", body: `read: ${JSON.stringify(read)}` }));
       }
     }

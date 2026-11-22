@@ -7,7 +7,7 @@ import { Store, type Membership, type WakeRequest } from "./store.ts";
 
 type WakeHost = {
   ready(): boolean;
-  submit(request: WakeRequest): void;
+  submit(request: WakeRequest, coordinator: boolean): void;
   receipts(): string[];
 };
 
@@ -60,6 +60,7 @@ export class Runtime {
   private retired = false;
   private lastStatus = "";
   private closing?: Promise<void>;
+  private joining?: { resolve(): void; reject(error: Error): void };
   private sends = new Set<Promise<unknown>>();
 
   private p: Profile;
@@ -79,12 +80,45 @@ export class Runtime {
       || (request !== undefined && known.member !== request))) {
       throw new Error("session is already associated with another membership or transcript");
     }
-    this.member = known?.member ?? request;
-    if (this.member === undefined) { this.render(); return; }
-    if (!this.p.members.includes(this.member)) throw new Error("requested member is not in this group");
-    this.topics = selectors(this.p, this.who, this.member);
+    const member = known?.member ?? request;
+    if (member === undefined) { this.render(); return; }
+    this.listen(member);
+  }
+
+  assertUnassigned() {
+    if (this.member || this.store.bySession(this.who.id)) throw new Error("session is already assigned or joining");
+    if (this.retired || this.fatal) throw new Error("chatboard runtime is unavailable");
+  }
+
+  join(member: string): Promise<void> {
+    this.assertUnassigned();
+    if (!this.p.members.includes(member)) throw new Error("requested member is not in this group");
+    if (this.store.byMember(member)) throw new Error("member already enrolled; stopping a session does not release its association");
+    return new Promise((resolve, reject) => {
+      this.joining = { resolve, reject };
+      try { this.listen(member); }
+      catch (e) { this.rejectJoin(e as Error); }
+    });
+  }
+
+  private listen(member: string) {
+    if (!this.p.members.includes(member)) throw new Error("requested member is not in this group");
+    this.member = member;
+    this.topics = selectors(this.p, this.who, member);
     this.connect();
-    if (this.member !== this.p.coordinator) this.wakeTimer = setInterval(() => this.pumpWakes(), 400).unref();
+    this.wakeTimer = setInterval(() => this.pumpWakes(), 400).unref();
+  }
+
+  private rejectJoin(error: Error) {
+    const joining = this.joining;
+    this.joining = undefined;
+    this.member = this.reason = undefined;
+    this.topics = [];
+    clearInterval(this.wakeTimer);
+    this.wakeTimer = undefined;
+    this.state = "off";
+    joining?.reject(error);
+    if (!this.retired) this.render();
   }
 
   private connect() {
@@ -121,6 +155,10 @@ export class Runtime {
       this.publisher = undefined;
       this.pid = undefined;
       this.wait = "idle";
+      if (this.joining) {
+        this.rejectJoin(new Error(this.retired ? "session closed during join" : this.reason ?? "listener keeper stopped before enrollment"));
+        return;
+      }
       if (this.retired || this.fatal) return;
       this.schedule("keeper stopped; reconnecting", () => this.connect());
     });
@@ -128,14 +166,19 @@ export class Runtime {
 
   private async activate(child: Keeper) {
     const existing = this.store.bySession(this.who.id);
+    if (this.joining && existing) throw new Error("session is already enrolled");
+    if (this.joining && this.store.byMember(this.member!)) throw new Error("member already enrolled");
     const cut = existing?.cursor ?? (this.p.start === "now" ? await boardTail(args => boardCall(this.p, args)) : this.p.start);
     if (this.child !== child || child.stdin.destroyed || this.retired) return;
     verifyBoard(this.p);
-    const owner = this.store.activate(this.who, this.member!, cut);
+    const owner = this.store.activate(this.who, this.member!, cut, this.joining !== undefined);
     this.owner = owner;
     this.cursor = owner.cursor;
     this.publisher = new Publisher(this.p, owner, this.store, (args, timeout) => boardCall(this.p, args, timeout),
       () => { if (this.requireOwner() !== owner) throw new Error("stale chatboard publisher"); });
+    const joined = this.joining;
+    this.joining = undefined;
+    joined?.resolve();
     this.observeWakes();
     if (this.blocked) { this.state = "paused"; this.render(); }
     else this.ensureWait();
@@ -147,7 +190,10 @@ export class Runtime {
       case "ready":
         void this.activate(child).catch(error => {
           if (this.child !== child || this.retired) return;
-          this.fail(child, (error as Error).message);
+          if (this.joining) {
+            this.reason = (error as Error).message;
+            child.stdin.destroy(); // The close handler rejects once the keeper has released its lease.
+          } else this.fail(child, (error as Error).message);
         });
         break;
       case "busy": this.reason = "session address or group member is already live"; break;
@@ -268,7 +314,7 @@ export class Runtime {
       const request = this.store.claimWake(owner);
       if (!request) return;
       this.wakeRequest = { id: request.id, at: Date.now() };
-      this.wakeHost.submit(request);
+      this.wakeHost.submit(request, owner.member === this.p.coordinator);
       this.wakeIssue = undefined;
     } catch { this.wakeIssue = "could not process pending chatboard wakes"; }
   }
@@ -311,6 +357,7 @@ export class Runtime {
     return { intents: this.store.pending(owner), handoffs: this.store.pendingHandoffs(owner) };
   }
   send(send: Send) { this.requireOwner(); return this.track(this.publisher!.send(send)); }
+  report(body?: string) { this.requireOwner(); return this.track(this.publisher!.report(body)); }
   tell(messages: Tell[]) { this.requireOwner(); return this.track(this.publisher!.tell(messages)); }
   retry(id: string) { this.requireOwner(); return this.track(this.publisher!.retry(id)); }
   private track<T>(promise: Promise<T>): Promise<T> {

@@ -101,16 +101,16 @@ test("lost post acknowledgement pages beyond the first page; absent, conflict an
     throw new Error("simulated lost acknowledgement");
   };
   const client = new Publisher(profile, lane, store, call, () => {});
-  const one = await client.send({ action: "report", body: "--literal $HOME" });
+  const one = await client.send({ action: "note", targets: ["main"], body: "--literal $HOME" });
   assert.equal(one.state, "confirmed");
   assert.ok(pages > 1);
   assert.equal(posts, 1);
   assert.deepEqual(await client.retry(one.id), one);
   assert.equal(posts, 1);
   mode = "conflict";
-  assert.equal((await client.send({ action: "report", body: "intended" })).state, "conflict");
+  assert.equal((await client.send({ action: "note", targets: ["main"], body: "intended" })).state, "conflict");
   mode = "absent";
-  const missing = await client.send({ action: "report", body: "retain this ID" });
+  const missing = await client.send({ action: "note", targets: ["main"], body: "retain this ID" });
   assert.equal(missing.state, "unknown");
   assert.deepEqual(store.pending(lane), [missing.id]);
   mode = "confirm";
@@ -201,24 +201,42 @@ test("batch waits for complete board confirmation and exact inbox rows; retry an
   assert.deepEqual(reopened.pendingHandoffs(newLead), []);
 });
 
-test("failed control commit reports confirmed delivery and retries only wake registration", async t => {
-  const { open, profile } = setup(t);
+test("report confirms its board row before waking only the exact coordinator; retry does not repost", async t => {
+  const { open, profile } = setup(t, { members: ["main", "lane", "other"] });
   const store = open(), board = fixtureBoard();
-  const lead = store.activate(who("/lead.jsonl"), "main", 0);
   const lane = store.activate(who("/lane.jsonl"), "lane", 0);
-  const sender = new Publisher(profile, lead, store, board.call, () => store.assertOwner(lead));
+  const other = store.activate(who("/other.jsonl"), "other", 0);
+  const sender = new Publisher(profile, lane, store, board.call, () => store.assertOwner(lane));
+  await assert.rejects(sender.report("no coordinator yet"), /not enrolled/);
+  const lead = store.activate(who("/lead.jsonl"), "main", 0);
+  const item = to => ({ id: randomUUID(), payload: JSON.stringify({ to }) });
+  for (const items of [
+    [item([`session:${other.session}`])],
+    [item([`session:${lead.session}`, `session:${other.session}`])],
+    [item([`session:${lead.session}`]), item([`session:${lead.session}`])],
+    [item(["role:alpha-main"])],
+  ]) assert.throws(() => store.beginHandoff(lane, randomUUID(), items), /only its enrolled coordinator/);
+  assert.deepEqual(store.pendingHandoffs(lane), []);
+  assert.equal(board.attempts.length, 0);
+
   const schedule = store.scheduleHandoff.bind(store);
   store.scheduleHandoff = () => { throw new Error("simulated local control write failure"); };
-  const receipt = await sender.tell([{ targets: ["lane"], body: "delivered" }]);
+  const receipt = await sender.report("finished");
   assert.equal(receipt.state, "confirmed");
   assert.equal(receipt.wakeSchedule, "pending");
-  assert.deepEqual(store.pendingHandoffs(lead), [receipt.id]);
-  store.admit(lane, batch(1, board.rows[0]));
-  assert.equal(store.claimWake(lane), undefined);
+  assert.deepEqual(board.rows[0].to, [`session:${lead.session}`]);
+  assert.deepEqual(store.pendingHandoffs(lane), [receipt.id]);
+  assert.equal(store.claimWake(lead), undefined);
+
   store.scheduleHandoff = schedule;
   const retried = await sender.retry(receipt.id);
   assert.equal(retried.wakeSchedule, "registered");
   assert.deepEqual(retried.messages, receipt.messages);
   assert.equal(board.attempts.length, 1);
-  assert.equal(store.claimWake(lane).id, receipt.id);
+  assert.equal(store.claimWake(lead), undefined, "confirmed post alone is not enough");
+  store.admit(lead, batch(1, board.rows[0]));
+  assert.equal(store.claimWake(lead).id, receipt.id);
+  assert.equal(store.claimWake(other), undefined);
+  assert.equal(store.claimWake(lane), undefined);
+  assert.equal(store.claimWake(lead), undefined, "retry cannot resubmit an already requested wake");
 });

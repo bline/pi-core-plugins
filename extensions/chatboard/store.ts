@@ -105,7 +105,7 @@ export class Store {
 
   // Called only after the keeper holds both OS locks. Competing runtimes may
   // read the registry to resolve aliases but cannot replace an owned generation.
-  activate(who: Identity, member: string, initialCursor: number): Membership {
+  activate(who: Identity, member: string, initialCursor: number, newOnly = false): Membership {
     const { group, coordinator, members, suppressSelf } = this.p;
     const scope = JSON.stringify([1, selectors(this.p, who, member), suppressSelf ? who.id : null]);
     const policy = JSON.stringify([coordinator, [...members].sort()]);
@@ -115,6 +115,7 @@ export class Store {
         throw new Error("configured group membership changed; use a new group");
       }
       const known = this.bySession(who.id);
+      if (known && newOnly) throw new Error("session is already enrolled");
       if (known && (known.transcript !== who.path || known.namespace !== group
         || known.member !== member || known.scope !== scope)) {
         throw new Error("saved session identity or subscription conflicts with this profile");
@@ -224,10 +225,18 @@ export class Store {
       .get(id, owner.session) as StoredIntent | undefined;
   }
 
+  private assertWakeDirection(owner: Membership, items: { payload: string }[]) {
+    if (owner.member === this.p.coordinator) return;
+    const coordinator = this.byMember(this.p.coordinator);
+    const to = items.length === 1 ? JSON.parse(items[0].payload).to : undefined;
+    if (!coordinator || !Array.isArray(to) || to.length !== 1 || to[0] !== `session:${coordinator.session}`) {
+      throw new Error("a lane can wake only its enrolled coordinator with a single report");
+    }
+  }
+
   beginHandoff(owner: Membership, id: string, items: { id: string; payload: string }[]) {
     this.transaction(() => {
-      this.assertOwner(owner);
-      if (owner.member !== this.p.coordinator) throw new Error("only the configured coordinator can tell; use note for quiet sends");
+      this.assertWakeDirection(this.assertOwner(owner), items);
       this.db.prepare("INSERT INTO handoffs VALUES (?, ?)").run(id, owner.session);
       for (const item of items) {
         this.db.prepare("INSERT INTO intents VALUES (?, ?, ?, 'unknown', NULL)").run(item.id, owner.session, item.payload);
@@ -264,6 +273,7 @@ export class Store {
     this.transaction(() => {
       const items = this.handoff(owner, id);
       if (!items?.length || items.some(item => item.state !== "confirmed")) throw new Error("handoff not fully confirmed");
+      this.assertWakeDirection(this.assertOwner(owner), items);
       const dests = new Map<string, WakeRows>();
       for (const item of items) {
         const { to } = JSON.parse(item.payload) as { to: string[] };
